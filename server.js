@@ -8,19 +8,35 @@
 import "dotenv/config";
 import express from "express";
 import http from "node:http";
+import fs from "node:fs";
 import { Server } from "socket.io";
 import { fal } from "@fal-ai/client";
-import { PARTS, SPLITS, MAX_PLAYERS, partPrompt, assemblePrompt } from "./game.js";
+import { PARTS, SPLITS, MAX_PLAYERS, STYLE_SEC, partPrompt, assemblePrompt, modelPool, pickModel, FALLBACK_MODEL } from "./game.js";
 
 const PORT = process.env.PORT || 3000;
-const PART_MODEL = process.env.FAL_PART_MODEL || "fal-ai/flux/schnell";
+const MODEL_POOL = modelPool(process.env.FAL_PART_MODELS);   // modèles tirés au sort pour dessiner les parties
 const ASSEMBLE_MODEL = process.env.FAL_ASSEMBLE_MODEL || "fal-ai/nano-banana-2/edit";
 
+console.log("Modèles Fal tirés au sort :", MODEL_POOL.map(m => m.id).join(", "));
 if (!process.env.FAL_KEY) console.warn("⚠️  FAL_KEY manquante : copie .env.example en .env et ajoute ta clé.");
 fal.config({ credentials: process.env.FAL_KEY });
 
 const app = express();
 app.use(express.static("public"));
+
+// ---------- Historique des personnages ----------
+// Gardé en mémoire et copié dans history.json. Attention : sur l'offre gratuite de Render, ce fichier
+// est effacé à chaque redéploiement. Les images restent hébergées chez Fal.
+const HISTORY_FILE = process.env.HISTORY_FILE || "history.json";
+let history = [];
+try { history = JSON.parse(fs.readFileSync(HISTORY_FILE, "utf8")); } catch { history = []; }
+function addToHistory(entry) {
+  history.unshift(entry);
+  history = history.slice(0, 300);
+  fs.writeFile(HISTORY_FILE, JSON.stringify(history), () => {});
+  io.emit("history", history);
+}
+app.get("/api/history", (req, res) => res.json(history));
 const server = http.createServer(app);
 const io = new Server(server);
 
@@ -44,7 +60,10 @@ function publicState(g) {
     code: g.code, phase: g.phase, round: g.round, timerSec: g.timerSec, hostPid: g.hostPid,
     players: [...g.players.values()].map(p => ({ pid: p.pid, name: p.name, online: p.online })),
     order: g.order, assign: g.assign,
-    remainingMs: g.phase === "write" ? Math.max(0, g.deadline - Date.now()) : 0,
+    remainingMs: ["style", "write"].includes(g.phase) ? Math.max(0, g.deadline - Date.now()) : 0,
+    styleSubmitted: Object.keys(g.styles),
+    style: g.style,                                   // style tiré au sort (visible à partir de l'écriture)
+    model: g.model ? { id: g.model.id, name: g.model.name } : null,
     submitted: Object.keys(g.subs),
     progress: g.progress,
     done: Object.keys(g.images),
@@ -67,6 +86,7 @@ io.on("connection", socket => {
     const g = {
       code, hostPid: pid, phase: "lobby", round: 0, timerSec: 120, deadline: 0, timer: null,
       players: new Map(), order: [], assign: {}, subs: {}, images: {}, finalUrl: null, progress: null, error: null,
+      styles: {}, style: null, model: null,
     };
     games.set(code, g);
     joinRoom(g, pid, name); cb?.({ code });
@@ -107,12 +127,24 @@ io.on("connection", socket => {
     g.order = SPLITS[n];
     const who = shuffle(list.slice(0, n));
     g.assign = Object.fromEntries(g.order.map((part, i) => [part, who[i % who.length].pid]));
-    Object.assign(g, { round: g.round + 1, phase: "write", subs: {}, images: {}, finalUrl: null, progress: null, error: null });
-    g.deadline = Date.now() + g.timerSec * 1000;
+    Object.assign(g, { round: g.round + 1, phase: "style", subs: {}, images: {}, finalUrl: null, progress: null, error: null,
+      styles: {}, style: null, model: null });
+    g.deadline = Date.now() + STYLE_SEC * 1000;
     clearTimeout(g.timer);
-    g.timer = setTimeout(() => generate(g), g.timerSec * 1000 + 3000);   // 3 s de marge pour les derniers envois
+    g.timer = setTimeout(() => closeStyle(g), STYLE_SEC * 1000 + 3000);   // 3 s de marge pour les derniers envois
     broadcast(g);
   });
+
+  // Un joueur propose (ou modifie) un style
+  socket.on("style", ({ text } = {}, cb) => {
+    const g = myGame(); if (!g || g.phase !== "style") return cb?.({ error: "Trop tard !" });
+    g.styles[me.pid] = { text: clean(text, 400), name: g.players.get(me.pid)?.name };
+    cb?.({ ok: true });
+    broadcast(g);
+    const online = [...g.players.values()].filter(p => p.online);
+    if (online.every(p => g.styles[p.pid])) closeStyle(g);   // tout le monde a proposé : on tire au sort
+  });
+  socket.on("forceStyle", () => { const g = myGame(); if (amHost(g)) closeStyle(g); });
 
   // Un joueur envoie (ou renvoie) sa description
   socket.on("submit", ({ part, desc } = {}, cb) => {
@@ -155,6 +187,29 @@ io.on("connection", socket => {
   }
 });
 
+// ---------- Fin de l'étape du style : tirage au sort du style ET du modèle Fal ----------
+function closeStyle(g) {
+  if (g.phase !== "style") return;
+  clearTimeout(g.timer);
+  const props = Object.values(g.styles).filter(s => s.text);
+  const pick = props.length ? props[Math.floor(Math.random() * props.length)] : null;
+  g.style = pick ? { text: pick.text, name: pick.name, count: props.length } : null;
+  g.model = pickModel(MODEL_POOL);
+  console.log(`[${g.code}] manche ${g.round} : style « ${g.style?.text || "par défaut"} », modèle ${g.model.id}`);
+  g.phase = "write";
+  g.deadline = Date.now() + g.timerSec * 1000;
+  g.timer = setTimeout(() => generate(g), g.timerSec * 1000 + 3000);
+  broadcast(g);
+}
+
+// Appelle le modèle tiré au sort ; en cas d'échec, réessaie avec le modèle de secours
+async function drawWith(model, prompt) {
+  const { data } = await fal.subscribe(model.id, { input: model.input(prompt) });
+  const url = data?.images?.[0]?.url || data?.image?.url;
+  if (!url) throw new Error("Réponse Fal sans image");
+  return url;
+}
+
 // ---------- Génération avec Fal ----------
 async function generate(g) {
   if (g.phase !== "write") return;          // évite de lancer deux fois
@@ -168,10 +223,13 @@ async function generate(g) {
     // 1) Une image par partie, toutes en parallèle
     await Promise.all(g.order.map(async part => {
       try {
-        const { data } = await fal.subscribe(PART_MODEL, {
-          input: { prompt: partPrompt(part, g.subs[part]?.desc), image_size: "square_hd", num_images: 1 },
-        });
-        g.images[part] = data.images[0].url;
+        const prompt = partPrompt(part, g.subs[part]?.desc, g.style?.text);
+        try {
+          g.images[part] = await drawWith(g.model, prompt);
+        } catch (e) {
+          console.error(`Fal (${g.model.id}) a échoué pour ${part}, essai avec ${FALLBACK_MODEL.id}`, e?.body || e?.message || e);
+          g.images[part] = await drawWith(FALLBACK_MODEL, prompt);
+        }
       } catch (e) {
         console.error("Fal (partie)", part, e?.body || e);
         g.images[part] = null;
@@ -186,7 +244,7 @@ async function generate(g) {
     step("Assemblage du personnage…");
     const { data } = await fal.subscribe(ASSEMBLE_MODEL, {
       input: {
-        prompt: assemblePrompt(ok.map(part => ({ part, desc: g.subs[part]?.desc }))),
+        prompt: assemblePrompt(ok.map(part => ({ part, desc: g.subs[part]?.desc })), g.style?.text),
         image_urls: ok.map(p => g.images[p]),
         num_images: 1,
         aspect_ratio: "9:16",
@@ -198,10 +256,19 @@ async function generate(g) {
     g.error = "L'assemblage a échoué : voici les parties empilées, à la manière d'un vrai cadavre exquis.";
   }
   g.phase = "reveal"; g.progress = null;
+  const parts = g.order.map(p => g.images[p]).filter(Boolean);
+  if (g.finalUrl || parts.length) {
+    addToHistory({
+      id: `${g.code}_r${g.round}`, createdAt: Date.now(),
+      url: g.finalUrl, parts: g.finalUrl ? [] : parts,
+      names: [...new Set(g.order.map(p => g.subs[p]?.name || g.players.get(g.assign[p])?.name).filter(Boolean))],
+      style: g.style?.text || "", model: g.model?.name || "",
+    });
+  }
   broadcast(g);
 }
 
 // Mise à jour régulière du chrono pour tous les joueurs
-setInterval(() => { for (const g of games.values()) if (g.phase === "write") broadcast(g); }, 5000);
+setInterval(() => { for (const g of games.values()) if (["style", "write"].includes(g.phase)) broadcast(g); }, 5000);
 
 server.listen(PORT, () => console.log(`🎨 Cadavre exquis en ligne sur http://localhost:${PORT}`));

@@ -1,5 +1,5 @@
 // =========================================================
-// Règles du jeu : parties du corps, découpage, prompts Fal
+// Règles du jeu : parties du corps, découpage, modèles Fal, prompts
 // (partagé par le serveur ; modifiez librement ce fichier)
 // =========================================================
 
@@ -33,26 +33,59 @@ export const SPLITS = {
   8: ["tete", "cou", "torse", "bras", "mains", "bassin", "jambes_genoux", "pieds"],
 };
 export const MAX_PLAYERS = 8;
+export const STYLE_SEC = 60;   // temps pour proposer un style
 
-// Style visuel commun : la clé d'un assemblage cohérent.
-export const STYLE =
-  "Style: colorful storybook illustration, engraving-like ink linework, thick black outlines, flat bold colors, " +
-  "simple cel shading, soft light from the top left, front view, isolated on a plain light beige background, no text, no watermark.";
+// ---------------------------------------------------------
+// Modèles Fal tirés au sort à chaque manche (un seul modèle par manche,
+// pour que toutes les parties du corps aient le même rendu).
+// `input` adapte le prompt au format attendu par chaque modèle.
+// Vérifiez sur fal.ai/models que ces modèles existent toujours ;
+// ajoutez ou retirez des lignes librement.
+// ---------------------------------------------------------
+const square = p => ({ prompt: p, image_size: "square_hd", num_images: 1 });
+export const MODELS = [
+  { id: "fal-ai/flux/schnell",                name: "FLUX.1 [schnell]",            input: square },
+  { id: "fal-ai/flux/dev",                    name: "FLUX.1 [dev]",                input: square },
+  { id: "fal-ai/recraft/v3/text-to-image",    name: "Recraft V3",                  input: p => ({ prompt: p.slice(0, 1000), image_size: "square_hd" }) },
+  { id: "fal-ai/stable-diffusion-v35-large",  name: "Stable Diffusion 3.5 Large",  input: square },
+  { id: "wan/v2.6/text-to-image",             name: "Wan 2.6",                     input: p => ({ prompt: p, image_size: "square_hd", max_images: 1 }) },
+  { id: "fal-ai/nano-banana-2",               name: "Nano Banana 2",               input: p => ({ prompt: p, num_images: 1, aspect_ratio: "1:1" }) },
+];
+// Modèle de secours si le modèle tiré au sort échoue
+export const FALLBACK_MODEL = MODELS[0];
 
-// Prompt pour une partie du corps.
-export function partPrompt(part, desc) {
+// Liste des modèles autorisés : tous, ou ceux listés dans FAL_PART_MODELS (séparés par des virgules)
+export function modelPool(envList) {
+  const ids = String(envList || "").split(",").map(s => s.trim()).filter(Boolean);
+  if (!ids.length) return MODELS;
+  return ids.map(id => MODELS.find(m => m.id === id) || { id, name: id, input: square });
+}
+export const pickModel = pool => pool[Math.floor(Math.random() * pool.length)];
+
+// Style par défaut si personne n'a proposé de style
+export const DEFAULT_STYLE =
+  "naive joyful felt-pen drawing, thick slightly wobbly outlines, limited palette of yellow #f0d32b, blue #3f76bb, " +
+  "green #058f39, red #e62c28, pink #e169a4 and black, simple stripes and dots";
+
+const clip = (s, n) => { s = String(s || "").trim(); return s.length > n ? s.slice(0, n) + "…" : s; };
+const styleLine = style =>
+  style ? `Art style chosen by the players (written in French, apply it faithfully and recognizably): "${clip(style, 260)}".`
+        : `Art style: ${DEFAULT_STYLE}.`;
+
+// Prompt pour une partie du corps (gardé court : certains modèles limitent la longueur)
+export function partPrompt(part, desc, style) {
   const p = PARTS[part];
-  const d = (desc || "").trim() || "invent a surprising, poetic and strange version of it";
-  return `A single isolated ${p.en} of a fantastical character, nothing else of the body visible, centered, filling the frame. ` +
-         `Player's description (written in French, follow every detail: colors, materials, shapes, accessories): "${d}". ${STYLE}`;
+  const d = clip(desc, 420) || "invent a surprising, poetic and strange version of it";
+  return `${styleLine(style)} A single isolated ${p.en} of a fantastical character, nothing else of the body visible, ` +
+         `centered, front view, plain white background, no text. Player's description (in French, follow every detail: ` +
+         `colors, materials, shapes, accessories): "${d}".`;
 }
 
-// Prompt pour l'assemblage final (les images sont envoyées dans le même ordre).
-export function assemblePrompt(items) {
-  const list = items.map((it, i) =>
-    `Image ${i + 1} = ${PARTS[it.part].en}${it.desc ? ` (described as: "${it.desc}")` : ""}`).join("; ");
-  return `Combine the reference images into ONE single full-body character standing upright, front view, from head to toe, ` +
-         `in this top-to-bottom order: ${list}. Keep every specific feature of each part exactly (colors, shapes, materials, accessories) ` +
-         `so each part stays recognizable, and join them seamlessly at the neck, shoulders, waist and ankles. ` +
-         `Tall vertical composition, whole body visible. ${STYLE}`;
+// Prompt pour l'assemblage final (les images sont envoyées dans le même ordre)
+export function assemblePrompt(items, style) {
+  const list = items.map((it, i) => `image ${i + 1} = ${PARTS[it.part].en}`).join("; ");
+  return `Combine the reference images into ONE single full-body character standing upright, front view, head to toe, ` +
+         `in this top-to-bottom order: ${list}. Keep every specific feature of each part exactly (colors, shapes, materials, ` +
+         `accessories) so each part stays recognizable, and join them seamlessly at the neck, shoulders, waist and ankles. ` +
+         `${styleLine(style)} Plain white background, whole body visible, no text.`;
 }

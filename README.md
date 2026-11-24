@@ -1,12 +1,12 @@
-# Cadavre exquis : version serveur avec Fal
+# Exquisit : version serveur avec Fal
 
-Un jeu multijoueur en ligne. Chaque joueur décrit en secret une partie du corps, Fal dessine chaque partie, puis assemble le tout en un seul personnage.
+Un jeu multijoueur en ligne. Chaque joueur propose un style ; le site tire au sort **un style** et **un modèle Fal**. Chacun décrit ensuite en secret une partie du corps, le modèle tiré au sort dessine chaque partie dans ce style, puis un modèle d'édition assemble le tout en un seul personnage. Les personnages terminés rejoignent l'historique de la page d'accueil.
 
 ## Architecture
 
 ```
 navigateur (public/)  ──Socket.IO──►  serveur Node (server.js)  ──API──►  Fal
-  index.html, client.js,               parties en mémoire,                 1. une image par partie (FAL_PART_MODEL)
+  index.html, client.js,               parties en mémoire,                 1. une image par partie (modèle tiré au sort)
   style.css                            chrono, attribution,                2. assemblage multi-images (FAL_ASSEMBLE_MODEL)
                                        clé FAL_KEY (secrète)
 ```
@@ -45,9 +45,12 @@ Railway, Fly.io ou un petit VPS marchent aussi. Évitez les hébergements « ser
 
 - **Découpage du corps** : `SPLITS` dans `game.js`. Mettez à jour la copie dans `public/client.js`, qui sert à l'affichage.
 - **Style des images** : `STYLE` dans `game.js`. Un style commun et précis rend l'assemblage bien plus cohérent.
-- **Modèles Fal** : `FAL_PART_MODEL` et `FAL_ASSEMBLE_MODEL` dans `.env`. Le modèle d'assemblage doit accepter un champ `image_urls` (plusieurs images). Vérifiez sur fal.ai/models le nombre d'images qu'il accepte : à 8 joueurs, il en faut 8.
+- **Modèles Fal tirés au sort** : la liste `MODELS` dans `game.js` (nom, identifiant Fal, format des paramètres). Pour en garder seulement certains sans toucher au code, remplissez `FAL_PART_MODELS` dans `.env`. Si le modèle tiré au sort échoue, le serveur réessaie avec FLUX.1 [schnell].
+- **Modèle d'assemblage** : `FAL_ASSEMBLE_MODEL` dans `.env`. Le modèle d'assemblage doit accepter un champ `image_urls` (plusieurs images). Vérifiez sur fal.ai/models le nombre d'images qu'il accepte : à 8 joueurs, il en faut 8.
 
 ## Limites connues
+
+- L'historique est gardé dans `history.json` sur le serveur. Sur l'offre gratuite de Render, ce fichier est effacé à chaque redéploiement (et parfois au redémarrage) : pour un historique permanent, il faudra une base de données ou un disque persistant.
 
 - Les parties sont gardées en mémoire : un redémarrage du serveur les efface.
 - Les images Fal sont hébergées par Fal (adresses temporaires). Téléchargez celles que vous voulez garder.
